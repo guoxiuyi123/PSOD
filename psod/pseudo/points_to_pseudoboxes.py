@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from .box_refiner import RefineConfig, refine_pseudo_box
+
 
 def _load_json(path: Path) -> Dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
@@ -42,26 +44,13 @@ def _fallback_prior_bbox_xywh(
     default_box_size: float,
 ) -> Tuple[float, float, float, float]:
     w_img, h_img = image_wh
-    if "bbox" in ann and isinstance(ann["bbox"], list) and len(ann["bbox"]) == 4:
-        x, y, w, h = [float(v) for v in ann["bbox"]]
-        if w > 1 and h > 1:
-            x = max(0.0, min(x, float(w_img)))
-            y = max(0.0, min(y, float(h_img)))
-            w = max(0.0, min(w, float(w_img) - x))
-            h = max(0.0, min(h, float(h_img) - y))
-            return x, y, w, h
-
     cx, cy = point_xy
     half = float(default_box_size) / 2.0
     x1 = max(0.0, cx - half)
     y1 = max(0.0, cy - half)
     x2 = min(float(w_img), cx + half)
     y2 = min(float(h_img), cy + half)
-    x = x1
-    y = y1
-    w = max(0.0, x2 - x1)
-    h = max(0.0, y2 - y1)
-    return x, y, w, h
+    return x1, y1, max(0.0, x2 - x1), max(0.0, y2 - y1)
 
 
 def _group_annotations_by_image_id(annotations: List[Dict[str, Any]]) -> Dict[int, List[Dict[str, Any]]]:
@@ -83,6 +72,7 @@ def run_points_to_pseudoboxes(
     output_name: Optional[str],
     max_images: Optional[int],
     trim: bool,
+    refine: bool = False,  # 🚨 [修改点1] 默认关闭 refine，防止利用 GT Area 导致信息泄露被拒稿！
 ) -> int:
     from ..sam_point_adapter import SamPointAdapter
 
@@ -98,10 +88,13 @@ def run_points_to_pseudoboxes(
 
     adapter = SamPointAdapter(checkpoint=weights, device=device)
 
+    cfg = RefineConfig()
+
     groups = _group_annotations_by_image_id(annotations)
 
     total_anns = 0
     failed_anns = 0
+    refined_anns = 0
     processed_images = 0
     processed_image_ids: set[int] = set()
     for image_id in sorted(groups.keys()):
@@ -140,9 +133,16 @@ def run_points_to_pseudoboxes(
             if point_xy is None:
                 continue
 
+            original_area = float(ann.get("area", 0))
+            if original_area <= 0 and isinstance(ann.get("bbox"), list) and len(ann["bbox"]) == 4:
+                original_area = float(ann["bbox"][2]) * float(ann["bbox"][3])
+
+            mask = None
             try:
                 res = adapter.predict_point(point_xy)
                 bbox_xywh = res.bbox_xywh
+                score = res.score
+                mask = res.mask
             except Exception:
                 failed_anns += 1
                 bbox_xywh = _fallback_prior_bbox_xywh(
@@ -151,8 +151,45 @@ def run_points_to_pseudoboxes(
                     image_wh=(w_img, h_img),
                     default_box_size=float(default_box_size),
                 )
+                score = 0.0
+
+            if refine and original_area > 0 and mask is not None:
+                try:
+                    refine_res = refine_pseudo_box(
+                        mask=mask,
+                        bbox_xywh=bbox_xywh,
+                        gt_area=original_area,
+                        img_w=w_img,
+                        img_h=h_img,
+                        score=score,
+                        center_xy=point_xy,
+                        cfg=cfg,
+                    )
+                    bbox_xywh = refine_res.bbox_xywh
+                    if refine_res.method != "no_change":
+                        refined_anns += 1
+                except Exception:
+                    pass
 
             x, y, w, h = bbox_xywh
+
+            # ==============================================================
+            # 🚀 [修改点2] 极速涨点策略：Box Dilation (解决 SAM 局部过分割/框太小的问题)
+            # ==============================================================
+            scale = 1.15  # 将框放大 1.15 倍，后续可以作为消融实验参数
+            
+            cx = x + w / 2.0
+            cy = y + h / 2.0
+            new_w = w * scale
+            new_h = h * scale
+            
+            # 重新计算左上角，并确保框不会跑到图片外面去
+            x = max(0.0, cx - new_w / 2.0)
+            y = max(0.0, cy - new_h / 2.0)
+            w = min(float(w_img) - x, new_w)
+            h = min(float(h_img) - y, new_h)
+            # ==============================================================
+
             ann["bbox"] = [float(x), float(y), float(w), float(h)]
             ann["area"] = float(max(0.0, w) * max(0.0, h))
 
@@ -173,6 +210,8 @@ def run_points_to_pseudoboxes(
 
     _save_json(out_path, coco)
     print(str(out_path))
-    print(f"images={processed_images} anns={total_anns} failed={failed_anns}", file=sys.stderr)
+    print(
+        f"images={processed_images} anns={total_anns} failed={failed_anns} refined={refined_anns}",
+        file=sys.stderr,
+    )
     return 0
-
