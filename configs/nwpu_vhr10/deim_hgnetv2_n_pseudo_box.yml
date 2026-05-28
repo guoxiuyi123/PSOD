@@ -30,5 +30,5 @@ val_dataloader:
   num_workers: 4
   dataset:
     type: CocoDetection
-    img_folder: /home/pc/gxy/dataset/dataset_nwpu/NWPU-VHR-10-DET-test/images
-    ann_file: /home/pc/gxy/dataset/dataset_nwpu/NWPU-VHR-10-DET-test/annotations/test.json
+    img_folder: /home/pc/gxy/dataset/dataset_nwpu/NWPU-VHR-10-DET-train/images
+    ann_file: /home/pc/gxy/dataset/dataset_nwpu/NWPU-VHR-10-DET-train/annotations/train.json

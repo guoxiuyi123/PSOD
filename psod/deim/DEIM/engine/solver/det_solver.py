@@ -30,6 +30,29 @@ coco_name_tiny_list = ['ap', 'ap50', 'ap75', 'apt', 'aps', 'apm', 'apl', 'ar', '
 
 class DetSolver(BaseSolver):     
      
+    def _select_stage2_resume_path(self):
+        if not self.output_dir:
+            return None
+        best_stg1 = self.output_dir / 'best_stg1.pth'
+        if best_stg1.exists():
+            return best_stg1
+        last = self.output_dir / 'last.pth'
+        if last.exists():
+            return last
+        return None
+    
+    def _load_stage2_resume_state(self, epoch):
+        if epoch != self.train_dataloader.collate_fn.stop_epoch:
+            return False
+        resume_path = self._select_stage2_resume_path()
+        if resume_path is None:
+            logger.warning(ORANGE + f'Stage2 switch skipped: best_stg1.pth and last.pth not found in {self.output_dir}' + RESET)
+            return False
+        logger.info(ORANGE + f'Stage2 switch: loading {resume_path.name}' + RESET)
+        self.load_resume_state(str(resume_path))
+        return True
+    
+     
     def fit(self, cfg_str):
         self.train()
         args = self.cfg  
@@ -99,7 +122,7 @@ class DetSolver(BaseSolver):
                 self.train_dataloader.sampler.set_epoch(epoch)
 
             if epoch == self.train_dataloader.collate_fn.stop_epoch:     
-                self.load_resume_state(str(self.output_dir / 'best_stg1.pth'))
+                self._load_stage2_resume_state(epoch)
                 self.ema.decay = self.train_dataloader.collate_fn.ema_restart_decay   
                 # print(f'Refresh EMA at epoch {epoch} with decay {self.ema.decay}')    
                 logger.info(f'Refresh EMA at epoch {epoch} with decay {self.ema.decay}')
@@ -449,7 +472,7 @@ class DetSolver(BaseSolver):
                 self.train_dataloader.sampler.set_epoch(epoch)
 
             if epoch == self.train_dataloader.collate_fn.stop_epoch:
-                self.load_resume_state(str(self.output_dir / 'best_stg1.pth'))
+                self._load_stage2_resume_state(epoch)
                 self.ema.decay = self.train_dataloader.collate_fn.ema_restart_decay   
                 logger.info(f'Refresh EMA at epoch {epoch} with decay {self.ema.decay}') 
             
@@ -628,8 +651,7 @@ class DetSolver(BaseSolver):
             # Stage 2 开始时的特殊处理
             elif epoch >= self.train_dataloader.collate_fn.stop_epoch and epoch == self.train_dataloader.collate_fn.stop_epoch:
                 self.ema.decay -= 0.0001  # 衰减因子变小意味着当前模型参数在EMA更新中的占比更大
-                stg1_model_path = self.output_dir / f'best_stg1.pth'    
-                self.load_resume_state(str(stg1_model_path)) 
+                self._load_stage2_resume_state(epoch)
                 logger.info(f'🔄 Refresh EMA at epoch {epoch} with decay {self.ema.decay}')   
  
         return best_stat     
