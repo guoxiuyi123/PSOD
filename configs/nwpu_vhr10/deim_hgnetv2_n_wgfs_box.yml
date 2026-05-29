@@ -1,0 +1,47 @@
+__include__: [
+  '../../psod/deim/DEIM/configs/dfine/dfine_hgnetv2_n_custom.yml'
+]
+
+output_dir: outputs/nwpu_vhr10_wgfs_box_fullscale
+
+num_classes: 10
+remap_mscoco_category: False
+
+epoches: 120
+flat_epoch: 60
+no_aug_epoch: 15
+lr_gamma: 0.1
+
+# 使用WGFS stem替换默认StemBlock，提升小目标检测能力
+# WGFS通过Haar小波分解保留高频细节（边缘、纹理），对小目标检测至关重要
+DEIM:
+  backbone: HGNetv2
+
+HGNetv2:
+  name: 'B0'
+  return_idx: [2, 3]
+  freeze_at: -1
+  freeze_norm: False
+  use_lab: True
+  stem_type: wgfs  # 可选值: 'default' (原始StemBlock), 'wgfs' (小波下采样)
+
+train_dataloader:
+  total_batch_size: 16
+  num_workers: 4
+  dataset:
+    type: CocoDetection
+    img_folder: /home/pc/gxy/Point-DEIM/dataset/nwpu_vhr10/images/train
+    ann_file: /home/pc/gxy/PSOD/train_pseudo.json
+    transforms:
+      policy:
+        epoch: 112
+  collate_fn:
+    stop_epoch: 112
+
+val_dataloader:
+  total_batch_size: 8
+  num_workers: 4
+  dataset:
+    type: CocoDetection
+    img_folder: /home/pc/gxy/Point-DEIM/dataset/nwpu_vhr10/images/val
+    ann_file: /home/pc/gxy/Point-DEIM/dataset/nwpu_vhr10/annotations/instances_val.json

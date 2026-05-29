@@ -13,6 +13,7 @@ from .common import FrozenBatchNorm2d
 from ..core import register
 from ..extre_module.custom_nn.attention.ema import EMA
 from ..extre_module.custom_nn.attention.simam import SimAM
+from ..extre_module.custom_nn.stem.WGFS import WGFS
 from ..misc.dist_utils import Multiprocess_sync, is_dist_available_and_initialized
 from ..logger_module import get_logger
 
@@ -612,10 +613,12 @@ class HGNetv2(nn.Module):
                  freeze_norm=True,     
                  pretrained=True,
                  agg='se',
+                 stem_type='default',
                  local_model_dir='weight/hgnetv2/'): 
         super().__init__()  
         self.use_lab = use_lab
         self.return_idx = return_idx
+        self.stem_type = stem_type
 
         stem_channels = self.arch_configs[name]['stem_channels']    
         stage_config = self.arch_configs[name]['stage_config']
@@ -624,12 +627,18 @@ class HGNetv2(nn.Module):
         self._out_strides = [4, 8, 16, 32] 
         self._out_channels = [stage_config[k][2] for k in stage_config] 
    
-        # stem
-        self.stem = StemBlock(     
-                in_chs=stem_channels[0],
-                mid_chs=stem_channels[1],
-                out_chs=stem_channels[2],     
-                use_lab=use_lab)     
+        # stem - 可插拔设计
+        if stem_type == 'wgfs':
+            self.stem = WGFS(
+                in_channels=stem_channels[0],
+                out_channels=stem_channels[2])
+            logger.info(GREEN + f'Using WGFS stem for small object detection' + RESET)
+        else:
+            self.stem = StemBlock(     
+                    in_chs=stem_channels[0],
+                    mid_chs=stem_channels[1],
+                    out_chs=stem_channels[2],     
+                    use_lab=use_lab)     
    
         # stages     
         self.stages = nn.ModuleList()
