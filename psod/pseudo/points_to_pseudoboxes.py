@@ -139,11 +139,25 @@ def run_points_to_pseudoboxes(
 
             mask = None
             try:
-                res = adapter.predict_point(point_xy)
+                res = adapter.predict_point_enhanced(point_xy, num_jitter=5, jitter_radius=3.0)
                 bbox_xywh = res.bbox_xywh
                 score = res.score
                 mask = res.mask
+                area_ratio = res.mask_area_ratio
+                compactness = res.compactness
             except Exception:
+                failed_anns += 1
+                bbox_xywh = _fallback_prior_bbox_xywh(
+                    ann,
+                    point_xy=point_xy,
+                    image_wh=(w_img, h_img),
+                    default_box_size=float(default_box_size),
+                )
+                score = 0.0
+                area_ratio = 0.0
+                compactness = 0.0
+
+            if score < 0.3 or (area_ratio > 0.0 and area_ratio < 0.0005):
                 failed_anns += 1
                 bbox_xywh = _fallback_prior_bbox_xywh(
                     ann,
@@ -173,22 +187,30 @@ def run_points_to_pseudoboxes(
 
             x, y, w, h = bbox_xywh
 
-            # ==============================================================
-            # 🚀 [修改点2] 极速涨点策略：Box Dilation (解决 SAM 局部过分割/框太小的问题)
-            # ==============================================================
-            scale = 1.15  # 将框放大 1.15 倍，后续可以作为消融实验参数
-            
+            if score >= 0.8:
+                scale = 1.05
+            elif score >= 0.6:
+                scale = 1.10
+            elif score >= 0.4:
+                scale = 1.20
+            else:
+                scale = 1.30
+
+            if original_area > 0 and w > 0 and h > 0:
+                pseudo_area = w * h
+                area_ratio = pseudo_area / original_area
+                if area_ratio < 0.5:
+                    scale = max(scale, 1.25)
+
             cx = x + w / 2.0
             cy = y + h / 2.0
             new_w = w * scale
             new_h = h * scale
-            
-            # 重新计算左上角，并确保框不会跑到图片外面去
+
             x = max(0.0, cx - new_w / 2.0)
             y = max(0.0, cy - new_h / 2.0)
             w = min(float(w_img) - x, new_w)
             h = min(float(h_img) - y, new_h)
-            # ==============================================================
 
             ann["bbox"] = [float(x), float(y), float(w), float(h)]
             ann["area"] = float(max(0.0, w) * max(0.0, h))

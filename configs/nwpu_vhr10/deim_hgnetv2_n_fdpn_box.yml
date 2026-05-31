@@ -1,0 +1,76 @@
+__include__: [
+  '../../psod/deim/DEIM/configs/dfine/dfine_hgnetv2_n_custom.yml'
+]
+
+output_dir: outputs/nwpu_vhr10_fdpn_box_fullscale
+
+num_classes: 10
+remap_mscoco_category: False
+
+epoches: 120
+flat_epoch: 60
+no_aug_epoch: 15
+lr_gamma: 0.1
+
+# 使用FDPN替换HybridEncoder，提升小目标检测能力
+# FDPN通过聚焦扩散特征金字塔网络优化跨尺度特征融合
+DEIM:
+  backbone: HGNetv2
+  encoder: FDPN
+  decoder: DFINETransformer
+
+HGNetv2:
+  name: 'B0'
+  return_idx: [1, 2, 3]  # FDPN需要3层特征图
+  freeze_at: -1
+  freeze_norm: False
+  use_lab: True
+  stem_type: wgfs  # 使用小波下采样stem
+
+# FDPN配置
+FDPN:
+  in_channels: [256, 512, 1024]  # HGNetv2 B0的输出通道数
+  feat_strides: [8, 16, 32]
+  hidden_dim: 128
+  nhead: 8
+  dim_feedforward: 512
+  dropout: 0.0
+  enc_act: 'gelu'
+  use_encoder_idx: [2]
+  num_encoder_layers: 1
+  pe_temperature: 10000
+  fdpn_ks: [3, 5, 7, 9]
+  depth_mult: 0.5
+  out_strides: [16, 32]
+  eval_spatial_size: [640, 640]
+
+DFINETransformer:
+  feat_channels: [128, 128]
+  feat_strides: [16, 32]
+  hidden_dim: 128
+  dim_feedforward: 512
+  num_levels: 2
+  num_layers: 3
+  eval_idx: -1
+  num_points: [6, 6]
+
+train_dataloader:
+  total_batch_size: 16
+  num_workers: 4
+  dataset:
+    type: CocoDetection
+    img_folder: /home/pc/gxy/Point-DEIM/dataset/nwpu_vhr10/images/train
+    ann_file: /home/pc/gxy/PSOD/train_pseudo.json
+    transforms:
+      policy:
+        epoch: 112
+  collate_fn:
+    stop_epoch: 112
+
+val_dataloader:
+  total_batch_size: 8
+  num_workers: 4
+  dataset:
+    type: CocoDetection
+    img_folder: /home/pc/gxy/Point-DEIM/dataset/nwpu_vhr10/images/val
+    ann_file: /home/pc/gxy/Point-DEIM/dataset/nwpu_vhr10/annotations/instances_val.json

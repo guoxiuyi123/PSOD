@@ -74,6 +74,8 @@ class SamPointResult:
     bbox_xyxy: Tuple[float, float, float, float]
     bbox_xywh: Tuple[float, float, float, float]
     score: float
+    mask_area_ratio: float = 0.0
+    compactness: float = 0.0
 
 
 class SamPointAdapter:
@@ -149,6 +151,21 @@ class SamPointAdapter:
         self._r = r
         self._new_unpad_hw = (new_h, new_w)
 
+    @staticmethod
+    def _mask_to_quality_metrics(mask: np.ndarray, img_h: int, img_w: int) -> Tuple[float, float]:
+        mask_area = float(mask.sum())
+        image_area = float(img_h * img_w)
+        area_ratio = mask_area / image_area if image_area > 0 else 0.0
+
+        perimeter = 0
+        mask_uint8 = mask.astype(np.uint8)
+        diff_h = np.abs(np.diff(mask_uint8, axis=0))
+        diff_w = np.abs(np.diff(mask_uint8, axis=1))
+        perimeter = float(diff_h.sum() + diff_w.sum())
+        compactness = (4.0 * np.pi * mask_area) / (perimeter * perimeter) if perimeter > 0 else 0.0
+
+        return area_ratio, compactness
+
     def predict_point(
         self,
         point_xy: Tuple[float, float],
@@ -223,7 +240,11 @@ class SamPointAdapter:
         bbox_xyxy = (x1, y1, x2, y2)
         bbox_xywh = (x1, y1, x2 - x1, y2 - y1)
         score = float(pred_scores[best].item())
-        return SamPointResult(mask=mask, bbox_xyxy=bbox_xyxy, bbox_xywh=bbox_xywh, score=score)
+        area_ratio, compactness = self._mask_to_quality_metrics(mask, h, w)
+        return SamPointResult(
+            mask=mask, bbox_xyxy=bbox_xyxy, bbox_xywh=bbox_xywh,
+            score=score, mask_area_ratio=area_ratio, compactness=compactness,
+        )
 
     def predict(
         self,
@@ -237,6 +258,63 @@ class SamPointAdapter:
             return self.predict_point(point_xy, point_label=point_label, multimask_output=multimask_output)
         finally:
             self.reset_image()
+
+    def predict_point_enhanced(
+        self,
+        point_xy: Tuple[float, float],
+        point_label: int = 1,
+        num_jitter: int = 5,
+        jitter_radius: float = 3.0,
+    ) -> SamPointResult:
+        if (
+            self._im_tensor is None
+            or self._features is None
+            or self._orig_hw is None
+            or self._r is None
+            or self._new_unpad_hw is None
+        ):
+            raise RuntimeError("Call set_image(...) before predict_point_enhanced(...)")
+
+        h, w = self._orig_hw
+        best_result = None
+        best_quality = -1.0
+
+        candidates = [point_xy]
+        cx, cy = point_xy
+        for i in range(num_jitter):
+            angle = 2.0 * np.pi * i / num_jitter
+            jx = cx + jitter_radius * np.cos(angle)
+            jy = cy + jitter_radius * np.sin(angle)
+            jx = max(0.0, min(float(w), jx))
+            jy = max(0.0, min(float(h), jy))
+            candidates.append((jx, jy))
+
+        for pt in candidates:
+            try:
+                res = self.predict_point(pt, point_label=point_label, multimask_output=True)
+            except (ValueError, RuntimeError):
+                continue
+
+            score = res.score
+            area_ratio = res.mask_area_ratio
+            compactness = res.compactness
+
+            area_penalty = 0.0
+            if area_ratio > 0.5:
+                area_penalty = (area_ratio - 0.5) * 2.0
+            elif area_ratio < 0.001:
+                area_penalty = 0.5
+
+            quality = score * 0.5 + compactness * 0.3 + max(0, 0.2 - area_penalty)
+
+            if quality > best_quality:
+                best_quality = quality
+                best_result = res
+
+        if best_result is None:
+            raise ValueError("All prediction attempts failed")
+
+        return best_result
 
     @staticmethod
     def coco_xywh_to_center_xy(bbox_xywh: Tuple[float, float, float, float]) -> Tuple[float, float]:
