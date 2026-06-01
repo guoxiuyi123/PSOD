@@ -11,6 +11,7 @@ import urllib.request
 import numpy as np
 import torch
 import torch.nn.functional as F
+from scipy.ndimage import binary_fill_holes
 
 
 def _default_checkpoint() -> Path:
@@ -166,6 +167,33 @@ class SamPointAdapter:
 
         return area_ratio, compactness
 
+    @staticmethod
+    def _postprocess_mask(
+        mask: np.ndarray,
+        center_xy: Tuple[float, float],
+        morph_kernel: int = 0,
+    ) -> np.ndarray:
+        mask_filled = binary_fill_holes(mask.astype(np.uint8)).astype(bool)
+        return mask_filled
+
+    def _mask_to_bbox(self, mask: np.ndarray, center_xy: Tuple[float, float]) -> Tuple[Tuple[float, float, float, float], np.ndarray]:
+        mask_clean = self._postprocess_mask(mask, center_xy)
+
+        ys, xs = np.where(mask_clean)
+        if ys.size == 0:
+            return None, mask_clean
+
+        h, w = self._orig_hw
+        x1 = max(0.0, float(xs.min()))
+        y1 = max(0.0, float(ys.min()))
+        x2 = min(float(w), float(xs.max() + 1))
+        y2 = min(float(h), float(ys.max() + 1))
+
+        if x2 <= x1 or y2 <= y1:
+            return None, mask_clean
+
+        return (x1, y1, x2, y2), mask_clean
+
     def predict_point(
         self,
         point_xy: Tuple[float, float],
@@ -212,7 +240,7 @@ class SamPointAdapter:
         new_h, new_w = self._new_unpad_hw
         mask_unpad = mask_1024[:new_h, :new_w]
         h, w = self._orig_hw
-        mask = (
+        mask_raw = (
             np.array(
                 Image.fromarray(mask_unpad.astype(np.uint8) * 255).resize((w, h), resample=Image.NEAREST),
                 dtype=np.uint8,
@@ -220,23 +248,11 @@ class SamPointAdapter:
             > 0
         )
 
-        ys, xs = np.where(mask)
-        if ys.size == 0:
-            raise ValueError("Empty mask")
+        bbox_result, mask = self._mask_to_bbox(mask_raw, point_xy)
+        if bbox_result is None:
+            raise ValueError("Empty mask after postprocessing")
 
-        x1 = float(xs.min())
-        y1 = float(ys.min())
-        x2 = float(xs.max() + 1)
-        y2 = float(ys.max() + 1)
-
-        x1 = max(0.0, min(x1, float(w)))
-        y1 = max(0.0, min(y1, float(h)))
-        x2 = max(0.0, min(x2, float(w)))
-        y2 = max(0.0, min(y2, float(h)))
-
-        if x2 <= x1 or y2 <= y1:
-            raise ValueError("Invalid bbox from mask")
-
+        x1, y1, x2, y2 = bbox_result
         bbox_xyxy = (x1, y1, x2, y2)
         bbox_xywh = (x1, y1, x2 - x1, y2 - y1)
         score = float(pred_scores[best].item())
@@ -258,6 +274,104 @@ class SamPointAdapter:
             return self.predict_point(point_xy, point_label=point_label, multimask_output=multimask_output)
         finally:
             self.reset_image()
+
+    def _decode_mask_at_index(self, mask_logits, idx, point_xy):
+        from PIL import Image
+        h, w = self._orig_hw
+        new_h, new_w = self._new_unpad_hw
+
+        m256 = mask_logits[idx].unsqueeze(0).unsqueeze(0)
+        m1024 = F.interpolate(m256, (1024, 1024), mode="bilinear", align_corners=False)[0, 0]
+        m_bin = (m1024 > float(self.model.mask_threshold)).to(torch.uint8).cpu().numpy()
+        m_unpad = m_bin[:new_h, :new_w]
+        mask_raw = (
+            np.array(
+                Image.fromarray(m_unpad.astype(np.uint8) * 255).resize((w, h), resample=Image.NEAREST),
+                dtype=np.uint8,
+            )
+            > 0
+        )
+        bbox_result, mask = self._mask_to_bbox(mask_raw, point_xy)
+        if bbox_result is None:
+            return None
+        x1, y1, x2, y2 = bbox_result
+        area_ratio, compactness = self._mask_to_quality_metrics(mask, h, w)
+        return SamPointResult(
+            mask=mask,
+            bbox_xyxy=(x1, y1, x2, y2),
+            bbox_xywh=(x1, y1, x2 - x1, y2 - y1),
+            score=0.0,
+            mask_area_ratio=area_ratio,
+            compactness=compactness,
+        )
+
+    def predict_point_area_guided(
+        self,
+        point_xy: Tuple[float, float],
+        target_area: float,
+        point_label: int = 1,
+    ) -> SamPointResult:
+        if (
+            self._im_tensor is None
+            or self._features is None
+            or self._orig_hw is None
+            or self._r is None
+            or self._new_unpad_hw is None
+        ):
+            raise RuntimeError("Call set_image(...) before predict_point_area_guided(...)")
+
+        x, y = float(point_xy[0]), float(point_xy[1])
+        if not np.isfinite(x) or not np.isfinite(y):
+            raise ValueError(f"Invalid point: {point_xy}")
+
+        points = torch.tensor([[x, y]], dtype=torch.float32, device=self.device) * float(self._r)
+        labels = torch.tensor([int(point_label)], dtype=torch.int32, device=self.device)
+        points_t = (points[:, None, :], labels[:, None])
+
+        with torch.no_grad():
+            sparse_emb, dense_emb = self.model.prompt_encoder(points=points_t, boxes=None, masks=None)
+            pred_masks, pred_scores = self.model.mask_decoder(
+                image_embeddings=self._features,
+                image_pe=self.model.prompt_encoder.get_dense_pe(),
+                sparse_prompt_embeddings=sparse_emb,
+                dense_prompt_embeddings=dense_emb,
+                multimask_output=True,
+            )
+
+        pred_masks = pred_masks[0]
+        pred_scores = pred_scores[0]
+
+        best_result = None
+        best_distance = float('inf')
+        n_masks = pred_masks.shape[0]
+
+        for i in range(n_masks):
+            res = self._decode_mask_at_index(pred_masks, i, point_xy)
+            if res is None:
+                continue
+            _, _, rw, rh = res.bbox_xywh
+            mask_area = rw * rh
+            score = float(pred_scores[i].item())
+            if target_area > 0:
+                area_distance = abs(mask_area - target_area) / target_area
+            else:
+                area_distance = 0.0
+            combined = area_distance - score * 0.3
+            if combined < best_distance:
+                best_distance = combined
+                best_result = SamPointResult(
+                    mask=res.mask,
+                    bbox_xyxy=res.bbox_xyxy,
+                    bbox_xywh=res.bbox_xywh,
+                    score=score,
+                    mask_area_ratio=res.mask_area_ratio,
+                    compactness=res.compactness,
+                )
+
+        if best_result is None:
+            raise ValueError("All mask candidates empty")
+
+        return best_result
 
     def predict_point_enhanced(
         self,
@@ -315,6 +429,84 @@ class SamPointAdapter:
             raise ValueError("All prediction attempts failed")
 
         return best_result
+
+    def predict_box_refine(
+        self,
+        bbox_xyxy: Tuple[float, float, float, float],
+    ) -> SamPointResult:
+        from PIL import Image
+
+        if (
+            self._im_tensor is None
+            or self._features is None
+            or self._orig_hw is None
+            or self._r is None
+            or self._new_unpad_hw is None
+        ):
+            raise RuntimeError("Call set_image(...) before predict_box_refine(...)")
+
+        x1, y1, x2, y2 = [float(v) for v in bbox_xyxy]
+        if not all(np.isfinite([x1, y1, x2, y2])):
+            raise ValueError(f"Invalid box: {bbox_xyxy}")
+
+        h, w = self._orig_hw
+        x1 = max(0.0, min(x1, float(w)))
+        y1 = max(0.0, min(y1, float(h)))
+        x2 = max(0.0, min(x2, float(w)))
+        y2 = max(0.0, min(y2, float(h)))
+
+        if x2 <= x1 or y2 <= y1:
+            raise ValueError(f"Invalid box after clamping: ({x1},{y1},{x2},{y2})")
+
+        box_tensor = torch.tensor([[x1, y1, x2, y2]], dtype=torch.float32, device=self.device) * float(self._r)
+
+        with torch.no_grad():
+            sparse_embeddings, dense_embeddings = self.model.prompt_encoder(
+                points=None, boxes=box_tensor, masks=None
+            )
+            pred_masks, pred_scores = self.model.mask_decoder(
+                image_embeddings=self._features,
+                image_pe=self.model.prompt_encoder.get_dense_pe(),
+                sparse_prompt_embeddings=sparse_embeddings,
+                dense_prompt_embeddings=dense_embeddings,
+                multimask_output=False,
+            )
+
+        pred_masks = pred_masks[0]
+        pred_scores = pred_scores[0]
+        best = int(torch.argmax(pred_scores).item())
+
+        mask_logits_256 = pred_masks[best].unsqueeze(0).unsqueeze(0)
+        mask_logits_1024 = F.interpolate(mask_logits_256, (1024, 1024), mode="bilinear", align_corners=False)[0, 0]
+        mask_1024 = (mask_logits_1024 > float(self.model.mask_threshold)).to(torch.uint8).cpu().numpy()
+
+        new_h, new_w = self._new_unpad_hw
+        mask_unpad = mask_1024[:new_h, :new_w]
+        mask_raw = (
+            np.array(
+                Image.fromarray(mask_unpad.astype(np.uint8) * 255).resize((w, h), resample=Image.NEAREST),
+                dtype=np.uint8,
+            )
+            > 0
+        )
+
+        box_center = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+        bbox_result, mask = self._mask_to_bbox(mask_raw, box_center)
+        if bbox_result is None:
+            raise ValueError("Empty mask from box-prompt mask after postprocessing")
+
+        bx1, by1, bx2, by2 = bbox_result
+
+        score = float(pred_scores[best].item())
+        area_ratio, compactness = self._mask_to_quality_metrics(mask, h, w)
+        return SamPointResult(
+            mask=mask,
+            bbox_xyxy=(bx1, by1, bx2, by2),
+            bbox_xywh=(bx1, by1, bx2 - bx1, by2 - by1),
+            score=score,
+            mask_area_ratio=area_ratio,
+            compactness=compactness,
+        )
 
     @staticmethod
     def coco_xywh_to_center_xy(bbox_xywh: Tuple[float, float, float, float]) -> Tuple[float, float]:

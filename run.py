@@ -9,19 +9,19 @@ import json
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(PROJECT_ROOT, 'psod', 'deim', 'DEIM')) 
-
-from engine.logger_module import get_logger
-from engine.extre_module.torch_utils import check_cuda
-from engine.misc import dist_utils
-from engine.core import YAMLConfig, yaml_utils
-from engine.solver import TASKS
 
 RED, GREEN, BLUE, YELLOW, ORANGE, RESET = "\033[91m", "\033[92m", "\033[94m", "\033[93m", "\033[38;5;208m", "\033[0m"
-logger = get_logger(__name__)
 
 
 def run_deim(args) -> None:
+    sys.path.insert(0, os.path.join(PROJECT_ROOT, 'psod', 'deim', 'DEIM'))
+    from engine.logger_module import get_logger
+    from engine.extre_module.torch_utils import check_cuda
+    from engine.misc import dist_utils
+    from engine.core import YAMLConfig, yaml_utils
+    from engine.solver import TASKS
+
+    logger = get_logger(__name__)
     dist_utils.setup_distributed(args.print_rank, args.print_method, seed=args.seed)
     check_cuda()
 

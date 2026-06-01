@@ -139,12 +139,44 @@ def run_points_to_pseudoboxes(
 
             mask = None
             try:
-                res = adapter.predict_point_enhanced(point_xy, num_jitter=5, jitter_radius=3.0)
+                if original_area > 0:
+                    res = adapter.predict_point_area_guided(point_xy, target_area=original_area)
+                else:
+                    res = adapter.predict_point_enhanced(point_xy, num_jitter=5, jitter_radius=3.0)
                 bbox_xywh = res.bbox_xywh
                 score = res.score
                 mask = res.mask
                 area_ratio = res.mask_area_ratio
                 compactness = res.compactness
+
+                if score >= 0.3:
+                    prev_bbox = bbox_xywh
+                    for refine_round in range(3):
+                        x0, y0, w0, h0 = prev_bbox
+                        if w0 <= 0 or h0 <= 0:
+                            break
+                        box_xyxy = (x0, y0, x0 + w0, y0 + h0)
+                        try:
+                            box_res = adapter.predict_box_refine(box_xyxy)
+                        except Exception:
+                            break
+                        if box_res.score < score * 0.9:
+                            break
+                        new_bbox = box_res.bbox_xywh
+                        prev_w, prev_h = prev_bbox[2], prev_bbox[3]
+                        new_w, new_h = new_bbox[2], new_bbox[3]
+                        if prev_w > 0 and prev_h > 0:
+                            w_change = abs(new_w - prev_w) / prev_w
+                            h_change = abs(new_h - prev_h) / prev_h
+                            if w_change < 0.02 and h_change < 0.02:
+                                break
+                        bbox_xywh = new_bbox
+                        score = box_res.score
+                        mask = box_res.mask
+                        area_ratio = box_res.mask_area_ratio
+                        compactness = box_res.compactness
+                        prev_bbox = new_bbox
+
             except Exception:
                 failed_anns += 1
                 bbox_xywh = _fallback_prior_bbox_xywh(
@@ -187,20 +219,22 @@ def run_points_to_pseudoboxes(
 
             x, y, w, h = bbox_xywh
 
-            if score >= 0.8:
-                scale = 1.05
+            if score >= 0.8 and compactness >= 0.3:
+                scale = 1.02
             elif score >= 0.6:
-                scale = 1.10
+                scale = 1.05
             elif score >= 0.4:
-                scale = 1.20
+                scale = 1.10
             else:
-                scale = 1.30
+                scale = 1.15
 
             if original_area > 0 and w > 0 and h > 0:
                 pseudo_area = w * h
-                area_ratio = pseudo_area / original_area
-                if area_ratio < 0.5:
-                    scale = max(scale, 1.25)
+                area_diff = pseudo_area / original_area
+                if area_diff < 0.5:
+                    scale = max(scale, 1.20)
+                elif area_diff > 2.0:
+                    scale = min(scale, 1.02)
 
             cx = x + w / 2.0
             cy = y + h / 2.0
@@ -214,6 +248,8 @@ def run_points_to_pseudoboxes(
 
             ann["bbox"] = [float(x), float(y), float(w), float(h)]
             ann["area"] = float(max(0.0, w) * max(0.0, h))
+            ann["sam_score"] = float(score)
+            ann["sam_compactness"] = float(compactness)
 
         adapter.reset_image()
         processed_images += 1
@@ -225,6 +261,18 @@ def run_points_to_pseudoboxes(
             ann for ann in annotations if isinstance(ann, dict) and ann.get("image_id", None) in processed_image_ids
         ]
 
+    filtered_count = 0
+    filtered_anns = []
+    for ann in coco["annotations"]:
+        if not isinstance(ann, dict):
+            continue
+        s = ann.get("sam_score", 1.0)
+        if s < 0.3:
+            filtered_count += 1
+            continue
+        filtered_anns.append(ann)
+    coco["annotations"] = filtered_anns
+
     out_name = output_name
     if out_name is None:
         out_name = coco_json.stem + "_pseudo.json"
@@ -233,7 +281,7 @@ def run_points_to_pseudoboxes(
     _save_json(out_path, coco)
     print(str(out_path))
     print(
-        f"images={processed_images} anns={total_anns} failed={failed_anns} refined={refined_anns}",
+        f"images={processed_images} anns={total_anns} failed={failed_anns} refined={refined_anns} filtered={filtered_count}",
         file=sys.stderr,
     )
     return 0
